@@ -10,7 +10,8 @@ var builder = Host.CreateApplicationBuilder(args);
 builder.Logging.AddConsole(o => o.LogToStandardErrorThreshold = LogLevel.Trace);
 
 builder.Services.AddSingleton(_ => new SessionRegistry());
-builder.Services.AddSingleton<ICollectorAdapter, EventPipeCpuAdapter>();
+builder.Services.AddSingleton<EventPipeCpuAdapter>();
+builder.Services.AddSingleton<ICollectorAdapter>(sp => sp.GetRequiredService<EventPipeCpuAdapter>());
 
 builder.Services
     .AddMcpServer()

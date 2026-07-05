@@ -84,6 +84,38 @@ public class EndToEndProfilingTests
     }
 
     [Fact]
+    public async Task StartStop_Analyze_BurnCpuDominates()
+    {
+        var process = TestEnvironment.StartBurnerApp(burnSeconds: 30);
+        var tracePath = Path.Combine(Path.GetTempPath(), $"dpmcp-test-{Guid.NewGuid():N}.nettrace");
+        try
+        {
+            var adapter = new EventPipeCpuAdapter();
+            var live = await adapter.StartAsync(process.Id, tracePath, CancellationToken.None);
+            await Task.Delay(TimeSpan.FromSeconds(5));
+            var result = await adapter.StopAsync(live, CancellationToken.None);
+
+            Assert.False(result.TargetExitedEarly);
+            Assert.True(result.ActualDuration >= TimeSpan.FromSeconds(4),
+                $"expected >=4s of collection, got {result.ActualDuration.TotalSeconds:F1}s");
+
+            var tree = new TraceAnalyzer().Analyze(result.TraceFilePath);
+            Assert.True(tree.TotalSamples > 500, $"expected >500 samples, got {tree.TotalSamples}");
+            Assert.DoesNotContain(tree.Warnings, w => w.Contains("unresolved"));
+
+            long burnInclusive = MaxInclusive(tree.Root, m => m.Contains("BurnCpu"));
+            double burnPercent = 100.0 * burnInclusive / tree.TotalSamples;
+            Assert.True(burnPercent > 50, $"BurnCpu has {burnPercent:F1}% inclusive, expected > 50%");
+        }
+        finally
+        {
+            try { process.Kill(entireProcessTree: true); } catch { }
+            File.Delete(tracePath);
+            File.Delete(Path.ChangeExtension(tracePath, ".etlx"));
+        }
+    }
+
+    [Fact]
     public async Task LaunchMode_ProfilesFromStartup_BurnCpuDominates()
     {
         var tracePath = Path.Combine(Path.GetTempPath(), $"dpmcp-test-{Guid.NewGuid():N}.nettrace");

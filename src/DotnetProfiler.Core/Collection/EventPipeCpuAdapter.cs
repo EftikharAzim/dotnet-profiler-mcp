@@ -17,6 +17,12 @@ public sealed class EventPipeCpuAdapter : ICollectorAdapter
 
     public string Name => "eventpipe-cpu";
 
+    private static EventPipeProvider[] CpuProviders() =>
+    [
+        new("Microsoft-DotNETCore-SampleProfiler", EventLevel.Informational),
+        new("Microsoft-Windows-DotNETRuntime", EventLevel.Informational, DotnetCommonKeywords),
+    ];
+
     public async Task<CollectionResult> CollectAsync(
         ProfilingTarget target,
         TimeSpan duration,
@@ -36,6 +42,91 @@ public sealed class EventPipeCpuAdapter : ICollectorAdapter
         return await RunSessionAsync(client, pid, duration, outputTracePath, ct);
     }
 
+    /// <summary>
+    /// Attach and start an open-ended CPU session — no fixed duration, caller decides when
+    /// to stop via <see cref="StopAsync"/>. Attach mode only (no launch-suspend-resume).
+    /// </summary>
+    public async Task<LiveCpuSession> StartAsync(int pid, string outputTracePath, CancellationToken ct)
+    {
+        EnsureAttachable(pid);
+        var client = new DiagnosticsClient(pid);
+
+        var session = await client.StartEventPipeSessionAsync(
+            CpuProviders(), requestRundown: true, circularBufferMB: 256, token: ct);
+
+        // From here the session is live in the target; anything that throws before we
+        // return the handle must dispose it or the target keeps a phantom session.
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(outputTracePath))!);
+            var fileStream = new FileStream(
+                outputTracePath, FileMode.Create, FileAccess.Write, FileShare.Read, bufferSize: 1 << 16, useAsync: true);
+
+            // Drain immediately or the runtime-side circular buffer overflows and drops events.
+            var copyTask = CopyStreamAsync(session.EventStream, fileStream);
+
+            return new LiveCpuSession(session, fileStream, copyTask, pid, outputTracePath, DateTimeOffset.UtcNow);
+        }
+        catch
+        {
+            session.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>Stop a session started by <see cref="StartAsync"/> and finalize its trace file.</summary>
+    public async Task<CollectionResult> StopAsync(LiveCpuSession live, CancellationToken ct)
+    {
+        var warnings = new List<string>();
+        bool targetExitedEarly = false;
+
+        using var stopCts = new CancellationTokenSource(StopTimeout);
+        try
+        {
+            // Stop() flushes rundown (method-name resolution) through the same stream.
+            await live.Session.StopAsync(stopCts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            warnings.Add($"Session stop timed out after {StopTimeout.TotalSeconds:F0}s; rundown may be missing and method names may not resolve.");
+        }
+        catch (Exception ex) when (ex is EndOfStreamException or IOException or DiagnosticsClientException)
+        {
+            targetExitedEarly = true;
+            warnings.Add($"Target process ended during session stop ({ex.GetType().Name}); summary reflects a partial trace.");
+        }
+
+        try
+        {
+            await live.CopyTask;
+        }
+        catch (Exception ex) when (ex is EndOfStreamException or IOException or ObjectDisposedException)
+        {
+            targetExitedEarly = true;
+            warnings.Add($"Event stream ended early ({ex.GetType().Name}); summary reflects a partial trace.");
+        }
+
+        await live.FileStream.DisposeAsync();
+        live.Session.Dispose();
+
+        if (new FileInfo(live.OutputTracePath).Length == 0)
+        {
+            throw new ProfilingException(
+                ProfilingException.Codes.TraceUnreadable,
+                "Collection produced an empty trace file.",
+                hint: "The target may have exited immediately or rejected the session.");
+        }
+
+        var actualDuration = DateTimeOffset.UtcNow - live.StartedAt;
+        return new CollectionResult(
+            TraceFilePath: live.OutputTracePath,
+            RequestedDuration: actualDuration,
+            ActualDuration: actualDuration,
+            TargetPid: live.Pid,
+            TargetExitedEarly: targetExitedEarly,
+            Warnings: warnings);
+    }
+
     private static readonly TimeSpan LaunchConnectTimeout = TimeSpan.FromSeconds(15);
 
     /// <summary>
@@ -48,9 +139,11 @@ public sealed class EventPipeCpuAdapter : ICollectorAdapter
     {
         var (fileName, arguments) = CommandLine.Split(target.LaunchCommand!);
 
-        // macOS caps unix socket paths around 104 chars — keep it short, in TMPDIR.
-        string socketPath = Path.Combine(
-            Path.GetTempPath(), $"dpmcp-{Guid.NewGuid().ToString("N")[..8]}.sock");
+        // Unix: a socket file — macOS caps socket paths around 104 chars, keep it short.
+        // Windows: a named pipe — the name must not contain path separators or colons.
+        string socketPath = OperatingSystem.IsWindows()
+            ? $"dpmcp-{Guid.NewGuid().ToString("N")[..8]}"
+            : Path.Combine(Path.GetTempPath(), $"dpmcp-{Guid.NewGuid().ToString("N")[..8]}.sock");
 
         var psi = new ProcessStartInfo(fileName, arguments)
         {
@@ -133,7 +226,8 @@ public sealed class EventPipeCpuAdapter : ICollectorAdapter
             child?.Dispose();
             if (connector is not null)
                 await connector.DisposeAsync();
-            try { File.Delete(socketPath); } catch { /* best effort */ }
+            if (!OperatingSystem.IsWindows()) // named pipes need no cleanup
+                try { File.Delete(socketPath); } catch { /* best effort */ }
         }
     }
 
@@ -192,18 +286,12 @@ public sealed class EventPipeCpuAdapter : ICollectorAdapter
         DiagnosticsClient client, int pid, TimeSpan duration, string outputTracePath, CancellationToken ct,
         Action? onSessionStarted = null)
     {
-        var providers = new[]
-        {
-            new EventPipeProvider("Microsoft-DotNETCore-SampleProfiler", EventLevel.Informational),
-            new EventPipeProvider("Microsoft-Windows-DotNETRuntime", EventLevel.Informational, DotnetCommonKeywords),
-        };
-
         var warnings = new List<string>();
         bool targetExitedEarly = false;
         var stopwatch = Stopwatch.StartNew();
 
         using var session = await client.StartEventPipeSessionAsync(
-            providers, requestRundown: true, circularBufferMB: 256, token: ct);
+            CpuProviders(), requestRundown: true, circularBufferMB: 256, token: ct);
 
         // In launch mode this resumes the suspended runtime — only after the session
         // is live, so startup is captured.

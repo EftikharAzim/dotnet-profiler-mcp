@@ -11,7 +11,7 @@ using ModelContextProtocol.Server;
 namespace DotnetProfiler.McpServer.Tools;
 
 [McpServerToolType]
-public sealed class ProfilingTools(SessionRegistry registry, ICollectorAdapter collector)
+public sealed class ProfilingTools(SessionRegistry registry, ICollectorAdapter collector, EventPipeCpuAdapter cpuAdapter)
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -98,6 +98,57 @@ public sealed class ProfilingTools(SessionRegistry registry, ICollectorAdapter c
         catch (Exception ex)
         {
             return Task.FromResult(ErrorJson(ex));
+        }
+    }
+
+    [McpServerTool(Name = "start_cpu_profile"), Description(
+        "Start an open-ended CPU profiling session on a running .NET process by pid (attach mode only). " +
+        "Sampling continues in the background until stop_cpu_profile is called with the returned session id.")]
+    public async Task<string> StartCpuProfile(
+        [Description("PID of the running .NET process to attach to.")]
+        int pid,
+        CancellationToken ct = default)
+    {
+        try
+        {
+            var session = registry.Create("cpu");
+            var live = await cpuAdapter.StartAsync(pid, session.TraceFilePath, ct);
+            registry.RegisterLive(session.Id, live);
+            return JsonSerializer.Serialize(new { sessionId = session.Id, targetPid = pid }, JsonOptions);
+        }
+        catch (Exception ex)
+        {
+            return ErrorJson(ex);
+        }
+    }
+
+    [McpServerTool(Name = "stop_cpu_profile"), Description(
+        "Stop a CPU profiling session started by start_cpu_profile and return the same hot-methods/hot-paths " +
+        "summary shape as profile_cpu.")]
+    public async Task<string> StopCpuProfile(
+        [Description("Session id returned by start_cpu_profile.")]
+        string sessionId,
+        [Description("How many hot methods / hot paths to return. Default 10.")]
+        int topN = 10,
+        CancellationToken ct = default)
+    {
+        try
+        {
+            topN = Math.Clamp(topN, 1, 100);
+            var live = registry.TakeLive(sessionId);
+            var result = await cpuAdapter.StopAsync(live, ct);
+
+            var tree = new TraceAnalyzer().Analyze(result.TraceFilePath);
+            var summary = new CpuSummaryBuilder().Build(
+                tree, topN, sessionId, result.TraceFilePath,
+                new TargetInfo("attach", result.TargetPid, null),
+                result.Warnings);
+
+            return JsonSerializer.Serialize(summary, JsonOptions);
+        }
+        catch (Exception ex)
+        {
+            return ErrorJson(ex);
         }
     }
 
