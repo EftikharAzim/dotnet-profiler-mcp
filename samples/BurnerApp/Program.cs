@@ -15,8 +15,14 @@ internal static class Burner
     {
         var sw = Stopwatch.StartNew();
         double sink = 0;
-        while (sw.Elapsed < duration)
+        long iterations = 0;
+        while (true)
         {
+            // Check the clock rarely: in a Debug build Stopwatch.get_Elapsed is an
+            // un-inlined call chain that would otherwise soak up the exclusive samples.
+            if ((iterations++ & 63) == 0 && sw.Elapsed >= duration)
+                break;
+
             for (int i = 1; i < 10_000; i++)
             {
                 sink += Math.Sqrt(i) * Math.Sin(i);

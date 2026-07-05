@@ -1,5 +1,6 @@
 using DotnetProfiler.Core;
 using DotnetProfiler.Core.Collection;
+using DotnetProfiler.Core.Parsing;
 using Microsoft.Diagnostics.Tracing.Etlx;
 
 namespace DotnetProfiler.Core.Tests;
@@ -42,6 +43,44 @@ public class EndToEndProfilingTests
             try { process.Kill(entireProcessTree: true); } catch { }
             File.Delete(tracePath);
         }
+    }
+
+    [Fact]
+    public async Task AttachMode_Analyze_BurnCpuDominates()
+    {
+        var process = TestEnvironment.StartBurnerApp(burnSeconds: 30);
+        var tracePath = Path.Combine(Path.GetTempPath(), $"dpmcp-test-{Guid.NewGuid():N}.nettrace");
+        try
+        {
+            var adapter = new EventPipeCpuAdapter();
+            await adapter.CollectAsync(
+                ProfilingTarget.ForPid(process.Id), TimeSpan.FromSeconds(5), tracePath, CancellationToken.None);
+
+            var tree = new TraceAnalyzer().Analyze(tracePath);
+
+            Assert.True(tree.TotalSamples > 500, $"expected >500 samples, got {tree.TotalSamples}");
+            Assert.DoesNotContain(tree.Warnings, w => w.Contains("unresolved"));
+
+            // BurnCpu must be where the samples land. Assert on inclusive: exclusive
+            // attribution shifts with inlining/build config, inclusive does not.
+            long burnInclusive = MaxInclusive(tree.Root, m => m.Contains("BurnCpu"));
+            double burnPercent = 100.0 * burnInclusive / tree.TotalSamples;
+            Assert.True(burnPercent > 50, $"BurnCpu has {burnPercent:F1}% inclusive, expected > 50%");
+        }
+        finally
+        {
+            try { process.Kill(entireProcessTree: true); } catch { }
+            File.Delete(tracePath);
+            File.Delete(Path.ChangeExtension(tracePath, ".etlx"));
+        }
+    }
+
+    private static long MaxInclusive(CallTreeNode node, Func<string, bool> methodMatch)
+    {
+        long max = methodMatch(node.MethodName) ? node.InclusiveSamples : 0;
+        foreach (var child in node.Children)
+            max = Math.Max(max, MaxInclusive(child, methodMatch));
+        return max;
     }
 
     [Fact]
