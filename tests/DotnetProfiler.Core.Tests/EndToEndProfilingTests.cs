@@ -84,6 +84,45 @@ public class EndToEndProfilingTests
     }
 
     [Fact]
+    public async Task LaunchMode_ProfilesFromStartup_BurnCpuDominates()
+    {
+        var tracePath = Path.Combine(Path.GetTempPath(), $"dpmcp-test-{Guid.NewGuid():N}.nettrace");
+        try
+        {
+            var adapter = new EventPipeCpuAdapter();
+            var result = await adapter.CollectAsync(
+                ProfilingTarget.ForLaunch($"\"{TestEnvironment.DotnetPath}\" \"{TestEnvironment.BurnerAppDll}\" 30"),
+                TimeSpan.FromSeconds(5),
+                tracePath,
+                CancellationToken.None);
+
+            Assert.False(result.TargetExitedEarly);
+            var tree = new TraceAnalyzer().Analyze(tracePath);
+            Assert.True(tree.TotalSamples > 500, $"expected >500 samples, got {tree.TotalSamples}");
+
+            long burnInclusive = MaxInclusive(tree.Root, m => m.Contains("BurnCpu"));
+            double burnPercent = 100.0 * burnInclusive / tree.TotalSamples;
+            Assert.True(burnPercent > 50, $"BurnCpu has {burnPercent:F1}% inclusive, expected > 50%");
+        }
+        finally
+        {
+            File.Delete(tracePath);
+            File.Delete(Path.ChangeExtension(tracePath, ".etlx"));
+        }
+    }
+
+    [Fact]
+    public async Task LaunchMode_ChildExitsImmediately_ThrowsLaunchConnectTimeout()
+    {
+        var adapter = new EventPipeCpuAdapter();
+        var ex = await Assert.ThrowsAsync<ProfilingException>(() =>
+            adapter.CollectAsync(
+                ProfilingTarget.ForLaunch("/usr/bin/true"), TimeSpan.FromSeconds(1),
+                Path.Combine(Path.GetTempPath(), "never-written.nettrace"), CancellationToken.None));
+        Assert.Equal(ProfilingException.Codes.LaunchConnectTimeout, ex.Code);
+    }
+
+    [Fact]
     public async Task AttachMode_NonDotnetPid_ThrowsNotADotnetProcess()
     {
         // PID 1 (launchd on macOS) is alive and definitely not .NET.
